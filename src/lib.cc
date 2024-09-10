@@ -4,6 +4,7 @@
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -25,6 +26,20 @@ using v8::String;
 using v8::Value;
 using v8::Exception;
 using v8::Boolean;
+
+// Bicubic interpolation helper functions
+float CubicInterpolate(float p[4], float x) {
+  return p[1] + 0.5 * x * (p[2] - p[0] + x * (2.0 * p[0] - 5.0 * p[1] + 4.0 * p[2] - p[3] + x * (3.0 * (p[1] - p[2]) + p[3] - p[0])));
+}
+
+float BicubicInterpolate(float p[4][4], float x, float y) {
+  float arr[4];
+  arr[0] = CubicInterpolate(p[0], y);
+  arr[1] = CubicInterpolate(p[1], y);
+  arr[2] = CubicInterpolate(p[2], y);
+  arr[3] = CubicInterpolate(p[3], y);
+  return CubicInterpolate(arr, x);
+}
 
 class Image : public node::ObjectWrap {
  public:
@@ -149,16 +164,31 @@ class Image : public node::ObjectWrap {
       return;
     }
 
-    // Simple nearest-neighbor scaling
+    // Bicubic interpolation
     for (int y = 0; y < newHeight; ++y) {
       for (int x = 0; x < newWidth; ++x) {
-        int srcX = static_cast<int>(x / widthRatio);
-        int srcY = static_cast<int>(y / heightRatio);
-        int srcIndex = (srcY * obj->width_ + srcX) * 3;
+        float gx = x / (float)newWidth * (obj->width_ - 1);
+        float gy = y / (float)newHeight * (obj->height_ - 1);
+        int gxi = (int)gx;
+        int gyi = (int)gy;
+
+        float result[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) {
+          float p[4][4];
+          for (int m = -1; m <= 2; ++m) {
+            for (int n = -1; n <= 2; ++n) {
+              int px = std::min(std::max(gxi + m, 0), obj->width_ - 1);
+              int py = std::min(std::max(gyi + n, 0), obj->height_ - 1);
+              p[m + 1][n + 1] = obj->pixels_[(py * obj->width_ + px) * 3 + c];
+            }
+          }
+          result[c] = BicubicInterpolate(p, gx - gxi, gy - gyi);
+        }
+
         int destIndex = (y * newWidth + x) * 3;
-        newPixels[destIndex] = obj->pixels_[srcIndex];
-        newPixels[destIndex + 1] = obj->pixels_[srcIndex + 1];
-        newPixels[destIndex + 2] = obj->pixels_[srcIndex + 2];
+        newPixels[destIndex] = std::min(std::max((int)result[0], 0), 255);
+        newPixels[destIndex + 1] = std::min(std::max((int)result[1], 0), 255);
+        newPixels[destIndex + 2] = std::min(std::max((int)result[2], 0), 255);
       }
     }
 
@@ -197,6 +227,13 @@ class Image : public node::ObjectWrap {
     std::transform(typeStr.begin(), typeStr.end(), typeStr.begin(),
                    [](unsigned char c){ return std::tolower(c); });
 
+    // Validate image type
+    if (typeStr != "png" && typeStr != "jpeg" && typeStr != "jpg") {
+      isolate->ThrowException(Exception::TypeError(
+          String::NewFromUtf8(isolate, "Unsupported image type").ToLocalChecked()));
+      return;
+    }
+
     // Default quality settings
     int pngCompressionLevel = 0;  // Default PNG compression (0-9)
     int jpegQuality = 100;        // Default JPEG quality (0-100)
@@ -226,10 +263,6 @@ class Image : public node::ObjectWrap {
       result = stbi_write_png(*filename, obj->width_, obj->height_, 3, obj->pixels_, obj->width_ * 3);
     } else if (typeStr == "jpeg" || typeStr == "jpg") {
       result = stbi_write_jpg(*filename, obj->width_, obj->height_, 3, obj->pixels_, jpegQuality);
-    } else {
-      isolate->ThrowException(Exception::TypeError(
-          String::NewFromUtf8(isolate, "Unsupported image type").ToLocalChecked()));
-      return;
     }
 
     args.GetReturnValue().Set(Boolean::New(isolate, result != 0));
